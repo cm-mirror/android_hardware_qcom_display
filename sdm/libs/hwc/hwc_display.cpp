@@ -49,6 +49,10 @@
 
 #define __CLASS__ "HWCDisplay"
 
+#ifdef QCOM_BSP
+#include <exhwcomposer_defs.h>
+#endif
+
 namespace sdm {
 
 static void ApplyDeInterlaceAdjustment(Layer *layer) {
