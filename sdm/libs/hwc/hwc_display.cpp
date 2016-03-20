@@ -560,7 +560,7 @@ int HWCDisplay::PrePrepareLayerStack(hwc_display_contents_1_t *content_list) {
     if (num_hw_layers <= kMaxLayerCount) {
       layer.flags.updating = IsLayerUpdating(content_list, i);
     }
-#ifdef 0
+#if 0
     if (hwc_layer.flags & HWC_SCREENSHOT_ANIMATOR_LAYER) {
       layer_stack_.flags.animating = true;
     }
