@@ -55,6 +55,18 @@
 
 namespace sdm {
 
+static void AssignLayerRegionsAddress(LayerRectArray *region, uint32_t rect_count,
+                                      uint8_t **base_address) {
+  if (rect_count) {
+    region->rect = reinterpret_cast<LayerRect *>(*base_address);
+    for (uint32_t i = 0; i < rect_count; i++) {
+      region->rect[i] = LayerRect();
+    }
+    *base_address += rect_count * sizeof(LayerRect);
+  }
+  region->count = rect_count;
+}
+
 static void ApplyDeInterlaceAdjustment(Layer *layer) {
   // De-interlacing adjustment
   if (layer->input_buffer->flags.interlace) {
@@ -65,8 +77,10 @@ static void ApplyDeInterlaceAdjustment(Layer *layer) {
 }
 
 HWCDisplay::HWCDisplay(CoreInterface *core_intf, hwc_procs_t const **hwc_procs, DisplayType type,
-                       int id, bool needs_blit)
-  : core_intf_(core_intf), hwc_procs_(hwc_procs), type_(type), id_(id), needs_blit_(needs_blit) {
+                       int id, bool needs_blit, qService::QService *qservice,
+                       DisplayClass display_class)
+  : core_intf_(core_intf), hwc_procs_(hwc_procs), type_(type), id_(id), needs_blit_(needs_blit),
+    qservice_(qservice), display_class_(display_class) {
 }
 
 int HWCDisplay::Init() {
@@ -124,7 +138,10 @@ int HWCDisplay::Deinit() {
     return -EINVAL;
   }
 
-  DeallocateLayerStack();
+  if (layer_stack_memory_.raw) {
+    delete[] layer_stack_memory_.raw;
+    layer_stack_memory_.raw = NULL;
+  }
 
   delete framebuffer_config_;
 
@@ -293,13 +310,21 @@ DisplayError HWCDisplay::Refresh() {
   return kErrorNotSupported;
 }
 
+DisplayError HWCDisplay::CECMessage(char *message) {
+  if (qservice_) {
+    qservice_->onCECMessageReceived(message, 0);
+  } else {
+    DLOGW("Qservice instance not available.");
+  }
+
+  return kErrorNone;
+}
+
 int HWCDisplay::AllocateLayerStack(hwc_display_contents_1_t *content_list) {
   if (!content_list || !content_list->numHwLayers) {
     DLOGW("Invalid content list");
     return -EINVAL;
   }
-
-  DeallocateLayerStack();
 
   size_t num_hw_layers = content_list->numHwLayers;
   uint32_t blit_target_count = 0;
@@ -308,76 +333,82 @@ int HWCDisplay::AllocateLayerStack(hwc_display_contents_1_t *content_list) {
     blit_target_count = kMaxBlitTargetLayers;
   }
 
-  layer_stack_.layer_count = UINT32(num_hw_layers + blit_target_count);
-  layer_stack_.layers = new Layer[layer_stack_.layer_count];
-  if (!layer_stack_.layers) {
-    return -ENOMEM;
-  }
+  // Allocate memory for
+  //  a) total number of layers
+  //  b) buffer handle for each layer
+  //  c) number of visible rectangles in each layer
+  //  d) number of dirty rectangles in each layer
+  //  e) number of blit rectangles in each layer
+  size_t required_size = (num_hw_layers + blit_target_count) *
+                         (sizeof(Layer) + sizeof(LayerBuffer));
 
-  for (size_t i = 0; i < layer_stack_.layer_count; i++) {
+  for (size_t i = 0; i < num_hw_layers + blit_target_count; i++) {
     uint32_t num_visible_rects = 0;
     uint32_t num_dirty_rects = 0;
 
-    hwc_layer_1_t &hwc_layer = content_list->hwLayers[i];
-    Layer &layer = layer_stack_.layers[i];
+    if (i < num_hw_layers) {
+      hwc_layer_1_t &hwc_layer = content_list->hwLayers[i];
+      num_visible_rects = INT32(hwc_layer.visibleRegionScreen.numRects);
+      num_dirty_rects = INT32(hwc_layer.surfaceDamage.numRects);
+    }
 
-    layer.input_buffer = new LayerBuffer;
-    if (!layer.input_buffer) {
+    // visible rectangles + dirty rectangles + blit rectangle
+    size_t num_rects = num_visible_rects + num_dirty_rects + blit_target_count;
+    required_size += num_rects * sizeof(LayerRect);
+  }
+
+  // Layer array may be large enough to hold current number of layers.
+  // If not, re-allocate it now.
+  if (layer_stack_memory_.size < required_size) {
+    if (layer_stack_memory_.raw) {
+      delete[] layer_stack_memory_.raw;
+      layer_stack_memory_.size = 0;
+    }
+
+    // Allocate in multiple of kSizeSteps.
+    required_size = ROUND_UP(required_size, layer_stack_memory_.kSizeSteps);
+    layer_stack_memory_.raw = new uint8_t[required_size];
+    if (!layer_stack_memory_.raw) {
       return -ENOMEM;
     }
 
+    layer_stack_memory_.size = required_size;
+  }
+
+  // Assign memory addresses now.
+  uint8_t *current_address = layer_stack_memory_.raw;
+
+  // Layer array address
+  layer_stack_ = LayerStack();
+  layer_stack_.layers = reinterpret_cast<Layer *>(current_address);
+  layer_stack_.layer_count = INT32(num_hw_layers + blit_target_count);
+  current_address += (num_hw_layers + blit_target_count) * sizeof(Layer);
+
+  for (size_t i = 0; i < num_hw_layers + blit_target_count; i++) {
+    uint32_t num_visible_rects = 0;
+    uint32_t num_dirty_rects = 0;
+
     if (i < num_hw_layers) {
-      num_visible_rects = hwc_layer.visibleRegionScreen.numRects;
-      num_dirty_rects = hwc_layer.surfaceDamage.numRects;
+      hwc_layer_1_t &hwc_layer = content_list->hwLayers[i];
+      num_visible_rects = UINT32(hwc_layer.visibleRegionScreen.numRects);
+      num_dirty_rects = UINT32(hwc_layer.surfaceDamage.numRects);
     }
 
-    if (num_visible_rects) {
-      layer.visible_regions.rect = new LayerRect[num_visible_rects];
-      if (!layer.visible_regions.rect) {
-        return -ENOMEM;
-      }
-      layer.visible_regions.count = num_visible_rects;
-    }
+    Layer &layer = layer_stack_.layers[i];
+    layer = Layer();
 
-    if (num_dirty_rects) {
-      layer.dirty_regions.rect = new LayerRect[num_dirty_rects];
-      if (!layer.dirty_regions.rect) {
-        return -ENOMEM;
-      }
-      layer.dirty_regions.count = num_dirty_rects;
-    }
+    // Layer buffer handle address
+    layer.input_buffer = reinterpret_cast<LayerBuffer *>(current_address);
+    *layer.input_buffer = LayerBuffer();
+    current_address += sizeof(LayerBuffer);
 
-    if (blit_target_count) {
-      layer.blit_regions.rect = new LayerRect[blit_target_count];
-      if (!layer.blit_regions.rect) {
-        return -ENOMEM;
-      }
-      layer.blit_regions.count = blit_target_count;
-    }
+    // Visible/Dirty/Blit rectangle address
+    AssignLayerRegionsAddress(&layer.visible_regions, num_visible_rects, &current_address);
+    AssignLayerRegionsAddress(&layer.dirty_regions, num_dirty_rects, &current_address);
+    AssignLayerRegionsAddress(&layer.blit_regions, blit_target_count, &current_address);
   }
 
   return 0;
-}
-
-void HWCDisplay::DeallocateLayerStack() {
-  if (!layer_stack_.layers) {
-    return;
-  }
-
-  for (size_t i = 0; i < layer_stack_.layer_count; i++) {
-    Layer &layer = layer_stack_.layers[i];
-
-    delete layer.input_buffer;
-    delete[] layer.visible_regions.rect;
-    delete[] layer.dirty_regions.rect;
-    delete[] layer.blit_regions.rect;
-  }
-
-  delete[] layer_stack_.layers;
-
-  // Reset layer stack to default values always. This will ensure that calling
-  // Allocate or Deallocate method twice does not result in unexpected behavior.
-  layer_stack_ = LayerStack();
 }
 
 int HWCDisplay::PrepareLayerParams(hwc_layer_1_t *hwc_layer, Layer *layer) {
@@ -467,11 +498,6 @@ void HWCDisplay::CommitLayerParams(hwc_layer_1_t *hwc_layer, Layer *layer) {
 int HWCDisplay::PrePrepareLayerStack(hwc_display_contents_1_t *content_list) {
   if (shutdown_pending_) {
     return 0;
-  }
-
-  if (!content_list || !content_list->numHwLayers) {
-    DLOGW("Invalid content list");
-    return -EINVAL;
   }
 
   size_t num_hw_layers = content_list->numHwLayers;
@@ -573,11 +599,7 @@ int HWCDisplay::PrePrepareLayerStack(hwc_display_contents_1_t *content_list) {
       layer_stack_.flags.cursor_present = true;
     }
 
-    if (layer.frame_rate > metadata_refresh_rate_) {
-      metadata_refresh_rate_ = SanitizeRefreshRate(layer.frame_rate);
-    } else {
-      layer.frame_rate = current_refresh_rate_;
-    }
+    PrepareDynamicRefreshRate(&layer);
 
     layer.input_buffer->buffer_id = reinterpret_cast<uint64_t>(hwc_layer.handle);
   }
@@ -1271,21 +1293,6 @@ void HWCDisplay::MarkLayersForGPUBypass(hwc_display_contents_1_t *content_list) 
   }
 }
 
-uint32_t HWCDisplay::RoundToStandardFPS(uint32_t fps) {
-  static const uint32_t standard_fps[4] = {30, 24, 48, 60};
-
-  int count = INT(sizeof(standard_fps) / sizeof(standard_fps[0]));
-  for (int i = 0; i < count; i++) {
-    if ((standard_fps[i] - fps) < 2) {
-      // Most likely used for video, the fps can fluctuate
-      // Ex: b/w 29 and 30 for 30 fps clip
-      return standard_fps[i];
-    }
-  }
-
-  return fps;
-}
-
 void HWCDisplay::ApplyScanAdjustment(hwc_rect_t *display_frame) {
 }
 
@@ -1467,6 +1474,35 @@ bool HWCDisplay::SingleLayerUpdating(uint32_t app_layer_count) {
   return (updating_count == 1);
 }
 
+bool HWCDisplay::SingleVideoLayerUpdating(uint32_t app_layer_count) {
+  uint32_t updating_count = 0;
+
+  for (uint i = 0; i < app_layer_count; i++) {
+    Layer *layer = &layer_stack_.layers[i];
+    if (layer->flags.updating && (layer->input_buffer->flags.video == true)) {
+      updating_count++;
+    }
+  }
+
+  return (updating_count == 1);
+}
+
+uint32_t HWCDisplay::RoundToStandardFPS(float fps) {
+  static const uint32_t standard_fps[4] = {30, 24, 48, 60};
+  uint32_t frame_rate = (uint32_t)(fps);
+
+  int count = INT(sizeof(standard_fps) / sizeof(standard_fps[0]));
+  for (int i = 0; i < count; i++) {
+    if ((standard_fps[i] - frame_rate) < 2) {
+      // Most likely used for video, the fps can fluctuate
+      // Ex: b/w 29 and 30 for 30 fps clip
+      return standard_fps[i];
+    }
+  }
+
+  return frame_rate;
+}
+
 uint32_t HWCDisplay::SanitizeRefreshRate(uint32_t req_refresh_rate) {
   uint32_t refresh_rate = req_refresh_rate;
 
@@ -1481,6 +1517,18 @@ uint32_t HWCDisplay::SanitizeRefreshRate(uint32_t req_refresh_rate) {
   }
 
   return refresh_rate;
+}
+
+DisplayClass HWCDisplay::GetDisplayClass() {
+  return display_class_;
+}
+
+void HWCDisplay::PrepareDynamicRefreshRate(Layer *layer) {
+  if (layer->frame_rate > metadata_refresh_rate_) {
+    metadata_refresh_rate_ = SanitizeRefreshRate(layer->frame_rate);
+  } else {
+    layer->frame_rate = current_refresh_rate_;
+  }
 }
 
 }  // namespace sdm
